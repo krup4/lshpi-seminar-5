@@ -9,6 +9,8 @@ cache_client.py — look-aside кеш над источником. КАРКАС:
   3) почините: single-flight ИЛИ concurrency-лимит — и источник выживает.
 """
 
+import asyncio
+
 
 class LookAsideCache:
     def __init__(self, source, ttl=60.0):
@@ -17,20 +19,37 @@ class LookAsideCache:
         self.store = {}        # key -> value (TTL для семинара упрощаем)
         self.hits = 0
         self.misses = 0
+        self._lock = asyncio.Lock()
+        self._inflight = {}    # key -> asyncio.Task
 
     async def get(self, key):
         if key in self.store:
             self.hits += 1
             return self.store[key]
 
-        # ПРОМАХ. Наивно: каждый промах идёт в источник напрямую.
-        # Когда кеш пуст, а запросов по одному ключу много и одновременно — все они
-        # ломятся в источник РАЗОМ (амплификация ×N). Источник деградирует и падает.
-        #
-        # TODO (задание 4): не дать всем промахам по одному ключу одновременно идти в источник.
-        #   Вариант А (single-flight): на ключ — один поход, остальные ждут его результат.
-        #   Вариант Б (concurrency-лимит): семафор на число одновременных походов в источник.
         self.misses += 1
+
+        async with self._lock:
+            if key in self.store:
+                return self.store[key]
+
+            task = self._inflight.get(key)
+            if task is None:
+                task = asyncio.create_task(self._load_from_source(key))
+                self._inflight[key] = task
+                owner = True
+            else:
+                owner = False
+
+        try:
+            return await task
+        finally:
+            if owner:
+                async with self._lock:
+                    if self._inflight.get(key) is task:
+                        del self._inflight[key]
+
+    async def _load_from_source(self, key):
         value = await self.source.get(key)
         self.store[key] = value
         return value
